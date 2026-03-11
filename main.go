@@ -11,31 +11,31 @@ type Storage interface {
 	Delete(key string)
 }
 
-type VaporDB struct {
+type VapourDB struct {
 	store map[string]string
 	mu    sync.RWMutex
 }
 
-func (v *VaporDB) Get(key string) string {
+func (v *VapourDB) Get(key string) string {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 	return v.store[key]
 }
 
-func (v *VaporDB) Set(key string, val string) {
+func (v *VapourDB) Set(key string, val string) {
 	v.mu.Lock()
 	v.store[key] = val
 	v.mu.Unlock()
 }
 
-func (v *VaporDB) Delete(key string) {
+func (v *VapourDB) Delete(key string) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	delete(v.store, key)
 }
 
-func createDb() *VaporDB {
-	return &VaporDB{
+func createDb() *VapourDB {
+	return &VapourDB{
 		store: make(map[string]string),
 	}
 }
