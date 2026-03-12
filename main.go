@@ -2,18 +2,28 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"os"
+	"os/signal"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 )
 
 var SUPPORTED_COMMANDS []string = []string{"GET", "SET", "DELETE", "VIEW"}
 var MAX_GOROUTINES int = 4
+
+type Command struct {
+	Root string
+	Key  string
+	Val  any
+}
 
 type Storage interface {
 	Get(key string) any
@@ -23,13 +33,8 @@ type Storage interface {
 }
 
 type RequestMessage struct {
-	conn    net.Conn
+	cs      *ConnState
 	payload string
-}
-
-type RequestError struct {
-	conn net.Conn
-	err  error
 }
 
 type DbServer struct {
@@ -37,7 +42,11 @@ type DbServer struct {
 	ln            net.Listener
 	quitCh        chan struct{}
 	msgCh         chan RequestMessage
-	errorCh       chan RequestError
+}
+
+type ConnState struct {
+	conn    net.Conn
+	writeCh chan string
 }
 
 func (db *DbServer) Start() error {
@@ -50,55 +59,54 @@ func (db *DbServer) Start() error {
 	db.ln = ln
 	go db.AcceptLoop()
 	<-db.quitCh
-	close(db.errorCh)
-	close(db.msgCh)
 	fmt.Println("Closing the server")
 	return nil
 }
 
-func (db *DbServer) AcceptLoop() error {
+func (db *DbServer) AcceptLoop() {
 	for {
 		conn, err := db.ln.Accept()
 		if err != nil {
 			fmt.Println(err)
-			continue
+			return
 		}
 		fmt.Println("Started accepting connection: ", conn.RemoteAddr())
-		go db.ReadConnection(conn)
+		cs := &ConnState{
+			conn:    conn,
+			writeCh: make(chan string, 32),
+		}
+		go WriteToConn(cs)
+		go db.ReadConnection(cs)
 	}
 }
 
-func (db *DbServer) ReadConnection(conn net.Conn) {
-	defer conn.Close()
-	reader := bufio.NewReader(conn)
+func (db *DbServer) ReadConnection(cs *ConnState) {
+	defer func() {
+		cs.conn.Close()
+		close(cs.writeCh)
+	}()
+	reader := bufio.NewReader(cs.conn)
 	for {
 		payloadLine, err := reader.ReadString('\n')
 		if err != nil {
-			db.errorCh <- RequestError{conn: conn, err: err}
+			if !errors.Is(err, io.EOF) {
+				cs.writeCh <- fmt.Sprintf("ERROR: %v", err)
+			}
 			return
 		}
-		req := RequestMessage{conn: conn, payload: payloadLine}
+		req := RequestMessage{cs: cs, payload: payloadLine}
 		db.msgCh <- req
 	}
 }
 
-func (db *DbServer) HandleCommand(store *VapourDB) {
+func (db *DbServer) HandleCommand(store Storage) {
 	for msg := range db.msgCh {
-		rootCommand, key, val, err := ParseCommand(msg.payload)
+		command, err := ParseCommand(msg.payload)
 		if err != nil {
-			if err == io.EOF {
-				return
-			}
-			db.errorCh <- RequestError{conn: msg.conn, err: err}
+			msg.cs.writeCh <- fmt.Sprintf("ERROR: %v", err)
 			continue
 		}
-		ExecuteCommand(store, msg.conn, rootCommand, key, val)
-	}
-}
-
-func (db *DbServer) HandleErrors() {
-	for err := range db.errorCh {
-		fmt.Fprintf(err.conn, "ERROR: %v", err.err)
+		ExecuteCommand(store, msg.cs, command.Root, command.Key, command.Val)
 	}
 }
 
@@ -130,6 +138,8 @@ func (v *VapourDB) Delete(key string) {
 }
 
 func (v *VapourDB) View() string {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
 	var output strings.Builder
 	output.WriteString("[key]: [value]\n")
 	for key, val := range v.store {
@@ -141,28 +151,29 @@ func (v *VapourDB) View() string {
 func NewServer(listeningAddr string) *DbServer {
 	return &DbServer{
 		listeningAddr: listeningAddr,
-		quitCh:        make(chan struct{}, 500),
-		msgCh:         make(chan RequestMessage, 500),
-		errorCh:       make(chan RequestError, 500),
+		quitCh:        make(chan struct{}, 1),
+		msgCh:         make(chan RequestMessage, MAX_GOROUTINES*10),
 	}
 }
 
-func CreateDb() *VapourDB {
+func CreateDb() Storage {
 	return &VapourDB{
 		store: make(map[string]any),
 	}
 }
 
-func ParseCommand(cmd string) (rootCommand string, key string, val any, err error) {
+func ParseCommand(cmd string) (Command, error) {
 	cmd = strings.TrimSpace(cmd)
 	command := strings.Fields(cmd)
-	err = nil
+	var err error = nil
 	if len(command) <= 0 {
-		return "", "", "", fmt.Errorf("Invalid command %s\n", cmd)
+		return Command{}, fmt.Errorf("Invalid command %s\n", cmd)
 	}
-	rootCommand = command[0]
+	rootCommand := command[0]
+	var key string
+	var val any
 	if !slices.Contains(SUPPORTED_COMMANDS, rootCommand) {
-		return "", "", "", fmt.Errorf("Unsupported command %s\n", rootCommand)
+		return Command{}, fmt.Errorf("Unsupported command %s\n", rootCommand)
 	}
 	if len(command) > 1 {
 		key = command[1]
@@ -180,27 +191,39 @@ func ParseCommand(cmd string) (rootCommand string, key string, val any, err erro
 		} else {
 			val, err = strconv.ParseInt(_val, 10, 64)
 		}
+		if err != nil {
+			val = _val
+		}
 	}
-	return rootCommand, key, val, err
+	return Command{
+		Root: rootCommand,
+		Key:  key,
+		Val:  val,
+	}, err
 }
 
-func ExecuteCommand(s Storage, conn net.Conn, rootCommand string, key string, val any) {
+func WriteToConn(cs *ConnState) {
+	for msg := range cs.writeCh {
+		fmt.Fprintf(cs.conn, "%v\n", msg)
+	}
+}
+
+func ExecuteCommand(s Storage, cs *ConnState, rootCommand string, key string, val any) {
 	switch rootCommand {
 	case "GET":
 		val := s.Get(key)
-		fmt.Fprintf(conn, "%v\n", val)
+		cs.writeCh <- fmt.Sprint(val)
 	case "DELETE":
 		s.Delete(key)
-		fmt.Fprintf(conn, "%v\n", key)
+		cs.writeCh <- key
 	case "SET":
 		s.Set(key, val)
-		fmt.Fprintf(conn, "%v\n", key)
+		cs.writeCh <- key
 	case "VIEW":
 		op := s.View()
-		fmt.Fprintf(conn, "%v\n", op)
-
+		cs.writeCh <- op
 	default:
-		panic("Unknown command")
+		cs.writeCh <- "UNKNOWN COMMAND"
 	}
 }
 
@@ -212,6 +235,13 @@ func main() {
 			dbServer.HandleCommand(vapourDB)
 		}()
 	}
-	go dbServer.HandleErrors()
+
+	signalCh := make(chan os.Signal, 1)
+	signal.Notify(signalCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-signalCh
+		dbServer.quitCh <- struct{}{}
+	}()
+
 	log.Fatal(dbServer.Start())
 }
