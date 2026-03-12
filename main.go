@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"slices"
@@ -11,13 +12,14 @@ import (
 	"sync"
 )
 
-var SUPPORTED_COMMANDS []string = []string{"GET", "SET", "DELETE"}
+var SUPPORTED_COMMANDS []string = []string{"GET", "SET", "DELETE", "VIEW"}
 var MAX_GOROUTINES int = 4
 
 type Storage interface {
 	Get(key string) any
 	Set(key string, val any)
 	Delete(key string)
+	View() string
 }
 
 type RequestMessage struct {
@@ -58,7 +60,8 @@ func (db *DbServer) AcceptLoop() error {
 	for {
 		conn, err := db.ln.Accept()
 		if err != nil {
-			return err
+			fmt.Println(err)
+			continue
 		}
 		fmt.Println("Started accepting connection: ", conn.RemoteAddr())
 		go db.ReadConnection(conn)
@@ -83,6 +86,9 @@ func (db *DbServer) HandleCommand(store *VapourDB) {
 	for msg := range db.msgCh {
 		rootCommand, key, val, err := ParseCommand(msg.payload)
 		if err != nil {
+			if err == io.EOF {
+				return
+			}
 			db.errorCh <- RequestError{conn: msg.conn, err: err}
 			continue
 		}
@@ -123,12 +129,21 @@ func (v *VapourDB) Delete(key string) {
 	delete(v.store, key)
 }
 
+func (v *VapourDB) View() string {
+	var output strings.Builder
+	output.WriteString("[key]: [value]\n")
+	for key, val := range v.store {
+		fmt.Fprintf(&output, "%v: %v (%T)\n", key, val, val)
+	}
+	return output.String()
+}
+
 func NewServer(listeningAddr string) *DbServer {
 	return &DbServer{
 		listeningAddr: listeningAddr,
-		quitCh:        make(chan struct{}, 10),
-		msgCh:         make(chan RequestMessage, 10),
-		errorCh:       make(chan RequestError, 10),
+		quitCh:        make(chan struct{}, 500),
+		msgCh:         make(chan RequestMessage, 500),
+		errorCh:       make(chan RequestError, 500),
 	}
 }
 
@@ -141,15 +156,17 @@ func CreateDb() *VapourDB {
 func ParseCommand(cmd string) (rootCommand string, key string, val any, err error) {
 	cmd = strings.TrimSpace(cmd)
 	command := strings.Fields(cmd)
-	if len(command) <= 1 {
+	err = nil
+	if len(command) <= 0 {
 		return "", "", "", fmt.Errorf("Invalid command %s\n", cmd)
 	}
 	rootCommand = command[0]
 	if !slices.Contains(SUPPORTED_COMMANDS, rootCommand) {
 		return "", "", "", fmt.Errorf("Unsupported command %s\n", rootCommand)
 	}
-	key = command[1]
-	err = nil
+	if len(command) > 1 {
+		key = command[1]
+	}
 	if len(command) > 2 {
 		var _val string
 		_val = strings.Join(command[2:], " ")
@@ -178,6 +195,10 @@ func ExecuteCommand(s Storage, conn net.Conn, rootCommand string, key string, va
 	case "SET":
 		s.Set(key, val)
 		fmt.Fprintf(conn, "%v\n", key)
+	case "VIEW":
+		op := s.View()
+		fmt.Fprintf(conn, "%v\n", op)
+
 	default:
 		panic("Unknown command")
 	}
