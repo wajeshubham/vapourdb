@@ -1,28 +1,117 @@
 package main
 
 import (
-	"os"
+	"bufio"
+	"fmt"
+	"log"
+	"net"
+	"slices"
+	"strconv"
+	"strings"
 	"sync"
 )
 
+var SUPPORTED_COMMANDS []string = []string{"GET", "SET", "DELETE"}
+var MAX_GOROUTINES int = 4
+
 type Storage interface {
-	Get(key string) string
-	Set(key string, val string)
+	Get(key string) any
+	Set(key string, val any)
 	Delete(key string)
 }
 
+type RequestMessage struct {
+	conn    net.Conn
+	payload string
+}
+
+type RequestError struct {
+	conn net.Conn
+	err  error
+}
+
+type DbServer struct {
+	listeningAddr string
+	ln            net.Listener
+	quitCh        chan struct{}
+	msgCh         chan RequestMessage
+	errorCh       chan RequestError
+}
+
+func (db *DbServer) Start() error {
+	ln, err := net.Listen("tcp", db.listeningAddr)
+	if err != nil {
+		return err
+	}
+	fmt.Println("Started Server")
+	defer ln.Close()
+	db.ln = ln
+	go db.AcceptLoop()
+	<-db.quitCh
+	close(db.errorCh)
+	close(db.msgCh)
+	fmt.Println("Closing the server")
+	return nil
+}
+
+func (db *DbServer) AcceptLoop() error {
+	for {
+		conn, err := db.ln.Accept()
+		if err != nil {
+			return err
+		}
+		fmt.Println("Started accepting connection: ", conn.RemoteAddr())
+		go db.ReadConnection(conn)
+	}
+}
+
+func (db *DbServer) ReadConnection(conn net.Conn) {
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+	for {
+		payloadLine, err := reader.ReadString('\n')
+		if err != nil {
+			db.errorCh <- RequestError{conn: conn, err: err}
+			return
+		}
+		req := RequestMessage{conn: conn, payload: payloadLine}
+		db.msgCh <- req
+	}
+}
+
+func (db *DbServer) HandleCommand(store *VapourDB) {
+	for msg := range db.msgCh {
+		rootCommand, key, val, err := ParseCommand(msg.payload)
+		if err != nil {
+			db.errorCh <- RequestError{conn: msg.conn, err: err}
+			continue
+		}
+		ExecuteCommand(store, msg.conn, rootCommand, key, val)
+	}
+}
+
+func (db *DbServer) HandleErrors() {
+	for err := range db.errorCh {
+		fmt.Fprintf(err.conn, "ERROR: %v", err.err)
+	}
+}
+
 type VapourDB struct {
-	store map[string]string
+	store map[string]any
 	mu    sync.RWMutex
 }
 
-func (v *VapourDB) Get(key string) string {
+func (v *VapourDB) Get(key string) any {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
-	return v.store[key]
+	val, ok := v.store[key]
+	if !ok {
+		return fmt.Sprintf("Key %s does not exist", key)
+	}
+	return val
 }
 
-func (v *VapourDB) Set(key string, val string) {
+func (v *VapourDB) Set(key string, val any) {
 	v.mu.Lock()
 	v.store[key] = val
 	v.mu.Unlock()
@@ -34,40 +123,74 @@ func (v *VapourDB) Delete(key string) {
 	delete(v.store, key)
 }
 
-func createDb() *VapourDB {
-	return &VapourDB{
-		store: make(map[string]string),
+func NewServer(listeningAddr string) *DbServer {
+	return &DbServer{
+		listeningAddr: listeningAddr,
+		quitCh:        make(chan struct{}, 10),
+		msgCh:         make(chan RequestMessage, 10),
+		errorCh:       make(chan RequestError, 10),
 	}
 }
 
-func runCommand(s Storage, rootCommand string, key string, val string) string {
+func CreateDb() *VapourDB {
+	return &VapourDB{
+		store: make(map[string]any),
+	}
+}
+
+func ParseCommand(cmd string) (rootCommand string, key string, val any, err error) {
+	cmd = strings.TrimSpace(cmd)
+	command := strings.Fields(cmd)
+	if len(command) <= 1 {
+		return "", "", "", fmt.Errorf("Invalid command %s\n", cmd)
+	}
+	rootCommand = command[0]
+	if !slices.Contains(SUPPORTED_COMMANDS, rootCommand) {
+		return "", "", "", fmt.Errorf("Unsupported command %s\n", rootCommand)
+	}
+	key = command[1]
+	err = nil
+	if len(command) > 2 {
+		var _val string
+		_val = strings.Join(command[2:], " ")
+		_val = strings.TrimSpace(_val)
+		if strings.HasPrefix(_val, `"`) && strings.HasSuffix(_val, `"`) {
+			val, err = strconv.Unquote(_val)
+		} else if strings.ToLower(_val) == "true" || strings.ToLower(_val) == "false" {
+			val, err = strconv.ParseBool(_val)
+		} else if strings.Contains(_val, ".") {
+			val, err = strconv.ParseFloat(_val, 64)
+		} else {
+			val, err = strconv.ParseInt(_val, 10, 64)
+		}
+	}
+	return rootCommand, key, val, err
+}
+
+func ExecuteCommand(s Storage, conn net.Conn, rootCommand string, key string, val any) {
 	switch rootCommand {
 	case "GET":
-		return s.Get(key)
+		val := s.Get(key)
+		fmt.Fprintf(conn, "%v\n", val)
 	case "DELETE":
 		s.Delete(key)
-		return key
+		fmt.Fprintf(conn, "%v\n", key)
 	case "SET":
 		s.Set(key, val)
-		return key
+		fmt.Fprintf(conn, "%v\n", key)
 	default:
 		panic("Unknown command")
 	}
 }
 
-func parseCommand(cmd []string) (rootCommand string, key string, val string) {
-	_rootCommand := cmd[0]
-	_key := cmd[1]
-	var _val string
-	if len(cmd) > 2 {
-		_val = cmd[2]
-	}
-	return _rootCommand, _key, _val
-}
-
 func main() {
-	vapourDB := createDb()
-	args := os.Args
-	rootCommand, key, val := parseCommand(args[1:])
-	runCommand(vapourDB, rootCommand, key, val)
+	vapourDB := CreateDb()
+	dbServer := NewServer(":8080")
+	for i := 0; i < MAX_GOROUTINES; i++ {
+		go func() {
+			dbServer.HandleCommand(vapourDB)
+		}()
+	}
+	go dbServer.HandleErrors()
+	log.Fatal(dbServer.Start())
 }
