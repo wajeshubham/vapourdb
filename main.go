@@ -67,10 +67,10 @@ func (db *DbServer) Start() error {
 		return err
 	}
 	fmt.Println("Started Server")
-	defer ln.Close()
 	db.ln = ln
 	go db.AcceptLoop()
 	<-db.quitCh
+	ln.Close()
 	close(db.aofCh)
 	close(db.msgCh)
 	db.aofFile.fileMu.Lock()
