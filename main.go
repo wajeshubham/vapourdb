@@ -46,7 +46,7 @@ type RequestMessage struct {
 type DbServer struct {
 	listeningAddr string
 	ln            net.Listener
-	aofFile       AOF
+	aofFile       *AOF
 	quitCh        chan struct{}
 	msgCh         chan RequestMessage
 	aofCh         chan Command
@@ -185,7 +185,7 @@ func NewServer(listeningAddr string) *DbServer {
 		listeningAddr: listeningAddr,
 		quitCh:        make(chan struct{}, 1),
 		msgCh:         make(chan RequestMessage, 1024),
-		aofFile:       AOF{file: aofFile, fileMu: sync.Mutex{}},
+		aofFile:       &AOF{file: aofFile, fileMu: sync.Mutex{}},
 		aofCh:         make(chan Command, 1024),
 	}
 }
