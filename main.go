@@ -9,20 +9,26 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 )
 
-var SUPPORTED_COMMANDS []string = []string{"GET", "SET", "DELETE", "VIEW"}
+var SUPPORTED_COMMANDS map[string]int = map[string]int{"GET": 2, "SET": 3, "DELETE": 2, "VIEW": 1}
 var MAX_GOROUTINES int = 4
+var AOF_FILENAME string = "vapour.aof"
 
 type Command struct {
-	Root string
-	Key  string
-	Val  any
+	Root   string
+	Key    string
+	Val    any
+	RawVal string
+}
+
+type AOF struct {
+	file   *os.File
+	fileMu sync.Mutex
 }
 
 type Storage interface {
@@ -40,6 +46,7 @@ type RequestMessage struct {
 type DbServer struct {
 	listeningAddr string
 	ln            net.Listener
+	aofFile       AOF
 	quitCh        chan struct{}
 	msgCh         chan RequestMessage
 }
@@ -106,8 +113,34 @@ func (db *DbServer) HandleCommand(store Storage) {
 			msg.cs.writeCh <- fmt.Sprintf("ERROR: %v", err)
 			continue
 		}
-		ExecuteCommand(store, msg.cs, command.Root, command.Key, command.Val)
+		ExecuteCommand(store, msg.cs, db, command)
 	}
+}
+
+func (db *DbServer) WriteAOF(cmd Command) error {
+	db.aofFile.fileMu.Lock()
+	defer db.aofFile.fileMu.Unlock()
+	stringCommand := fmt.Sprintf("%s %s %s\n", cmd.Root, cmd.Key, cmd.RawVal)
+	_, err := db.aofFile.file.WriteString(stringCommand)
+	return err
+}
+
+func (db *DbServer) LoadAOF(s Storage) error {
+	db.aofFile.fileMu.Lock()
+	defer db.aofFile.fileMu.Unlock()
+	db.aofFile.file.Seek(0, io.SeekStart) // Avoid ready AOF as the file opened with O_APPEND
+	scanner := bufio.NewScanner(db.aofFile.file)
+	for scanner.Scan() {
+		cmd := scanner.Text()
+		command, err := ParseCommand(cmd)
+		if err != nil {
+			continue
+		}
+		ApplyCommand(s, command)
+
+	}
+	fmt.Println("Loaded AOF")
+	return nil
 }
 
 type VapourDB struct {
@@ -149,10 +182,15 @@ func (v *VapourDB) View() string {
 }
 
 func NewServer(listeningAddr string) *DbServer {
+	aofFile, err := os.OpenFile(AOF_FILENAME, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
+	if err != nil {
+		panic(err)
+	}
 	return &DbServer{
 		listeningAddr: listeningAddr,
 		quitCh:        make(chan struct{}, 1),
 		msgCh:         make(chan RequestMessage, MAX_GOROUTINES*10),
+		aofFile:       AOF{file: aofFile, fileMu: sync.Mutex{}},
 	}
 }
 
@@ -170,16 +208,20 @@ func ParseCommand(cmd string) (Command, error) {
 		return Command{}, fmt.Errorf("Invalid command %s\n", cmd)
 	}
 	rootCommand := command[0]
+	var _val string
 	var key string
 	var val any
-	if !slices.Contains(SUPPORTED_COMMANDS, rootCommand) {
+	expectedLength, ok := SUPPORTED_COMMANDS[rootCommand]
+	if !ok {
 		return Command{}, fmt.Errorf("Unsupported command %s\n", rootCommand)
+	}
+	if len(command) < expectedLength {
+		return Command{}, fmt.Errorf("Invalid arguments for %s\n", rootCommand)
 	}
 	if len(command) > 1 {
 		key = command[1]
 	}
 	if len(command) > 2 {
-		var _val string
 		_val = strings.Join(command[2:], " ")
 		_val = strings.TrimSpace(_val)
 		if strings.HasPrefix(_val, `"`) && strings.HasSuffix(_val, `"`) {
@@ -196,9 +238,10 @@ func ParseCommand(cmd string) (Command, error) {
 		}
 	}
 	return Command{
-		Root: rootCommand,
-		Key:  key,
-		Val:  val,
+		Root:   rootCommand,
+		Key:    key,
+		Val:    val,
+		RawVal: _val,
 	}, err
 }
 
@@ -208,17 +251,29 @@ func WriteToConn(cs *ConnState) {
 	}
 }
 
-func ExecuteCommand(s Storage, cs *ConnState, rootCommand string, key string, val any) {
-	switch rootCommand {
+func ApplyCommand(s Storage, cmd Command) {
+	switch cmd.Root {
+	case "SET":
+		s.Set(cmd.Key, cmd.Val)
+
+	case "DELETE":
+		s.Delete(cmd.Key)
+	}
+}
+
+func ExecuteCommand(s Storage, cs *ConnState, dbServer *DbServer, cmd Command) {
+	switch cmd.Root {
 	case "GET":
-		val := s.Get(key)
+		val := s.Get(cmd.Key)
 		cs.writeCh <- fmt.Sprint(val)
 	case "DELETE":
-		s.Delete(key)
-		cs.writeCh <- key
+		dbServer.WriteAOF(cmd)
+		s.Delete(cmd.Key)
+		cs.writeCh <- cmd.Key
 	case "SET":
-		s.Set(key, val)
-		cs.writeCh <- key
+		dbServer.WriteAOF(cmd)
+		s.Set(cmd.Key, cmd.Val)
+		cs.writeCh <- cmd.Key
 	case "VIEW":
 		op := s.View()
 		cs.writeCh <- op
@@ -230,6 +285,7 @@ func ExecuteCommand(s Storage, cs *ConnState, rootCommand string, key string, va
 func main() {
 	vapourDB := CreateDb()
 	dbServer := NewServer(":8080")
+	(dbServer.LoadAOF(vapourDB))
 	for i := 0; i < MAX_GOROUTINES; i++ {
 		go func() {
 			dbServer.HandleCommand(vapourDB)
