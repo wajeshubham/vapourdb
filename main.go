@@ -150,7 +150,7 @@ func (db *DbServer) LoadAOF(s Storage) error {
 
 	}
 	fmt.Println("Loaded AOF")
-	return nil
+	return scanner.Err()
 }
 
 func (v *VapourDB) Get(key string) any {
