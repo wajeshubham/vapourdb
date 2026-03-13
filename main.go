@@ -13,10 +13,10 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 var SUPPORTED_COMMANDS map[string]int = map[string]int{"GET": 2, "SET": 3, "DELETE": 2, "VIEW": 1}
-var MAX_GOROUTINES int = 4
 var AOF_FILENAME string = "vapour.aof"
 
 type Command struct {
@@ -49,6 +49,11 @@ type DbServer struct {
 	aofFile       AOF
 	quitCh        chan struct{}
 	msgCh         chan RequestMessage
+	aofCh         chan Command
+}
+
+type VapourDB struct {
+	store map[string]any
 }
 
 type ConnState struct {
@@ -66,6 +71,11 @@ func (db *DbServer) Start() error {
 	db.ln = ln
 	go db.AcceptLoop()
 	<-db.quitCh
+	close(db.aofCh)
+	close(db.msgCh)
+	db.aofFile.fileMu.Lock()
+	db.aofFile.file.Close()
+	db.aofFile.fileMu.Unlock()
 	fmt.Println("Closing the server")
 	return nil
 }
@@ -143,14 +153,7 @@ func (db *DbServer) LoadAOF(s Storage) error {
 	return nil
 }
 
-type VapourDB struct {
-	store map[string]any
-	mu    sync.RWMutex
-}
-
 func (v *VapourDB) Get(key string) any {
-	v.mu.RLock()
-	defer v.mu.RUnlock()
 	val, ok := v.store[key]
 	if !ok {
 		return fmt.Sprintf("Key %s does not exist", key)
@@ -159,20 +162,14 @@ func (v *VapourDB) Get(key string) any {
 }
 
 func (v *VapourDB) Set(key string, val any) {
-	v.mu.Lock()
 	v.store[key] = val
-	v.mu.Unlock()
 }
 
 func (v *VapourDB) Delete(key string) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
 	delete(v.store, key)
 }
 
 func (v *VapourDB) View() string {
-	v.mu.RLock()
-	defer v.mu.RUnlock()
 	var output strings.Builder
 	output.WriteString("[key]: [value]\n")
 	for key, val := range v.store {
@@ -189,8 +186,9 @@ func NewServer(listeningAddr string) *DbServer {
 	return &DbServer{
 		listeningAddr: listeningAddr,
 		quitCh:        make(chan struct{}, 1),
-		msgCh:         make(chan RequestMessage, MAX_GOROUTINES*10),
+		msgCh:         make(chan RequestMessage, 1024),
 		aofFile:       AOF{file: aofFile, fileMu: sync.Mutex{}},
+		aofCh:         make(chan Command, 1024),
 	}
 }
 
@@ -234,6 +232,9 @@ func ParseCommand(cmd string) (Command, error) {
 			val, err = strconv.ParseInt(_val, 10, 64)
 		}
 		if err != nil {
+			fmt.Println("Parsing ERROR: ", err)
+			fmt.Println("Fallback to string type to handle error silently")
+			err = nil
 			val = _val
 		}
 	}
@@ -248,6 +249,12 @@ func ParseCommand(cmd string) (Command, error) {
 func WriteToConn(cs *ConnState) {
 	for msg := range cs.writeCh {
 		fmt.Fprintf(cs.conn, "%v\n", msg)
+	}
+}
+
+func (db *DbServer) AOFWriter() {
+	for cmd := range db.aofCh {
+		db.WriteAOF(cmd)
 	}
 }
 
@@ -267,11 +274,11 @@ func ExecuteCommand(s Storage, cs *ConnState, dbServer *DbServer, cmd Command) {
 		val := s.Get(cmd.Key)
 		cs.writeCh <- fmt.Sprint(val)
 	case "DELETE":
-		dbServer.WriteAOF(cmd)
+		dbServer.aofCh <- cmd
 		s.Delete(cmd.Key)
 		cs.writeCh <- cmd.Key
 	case "SET":
-		dbServer.WriteAOF(cmd)
+		dbServer.aofCh <- cmd // This might result in out of order commands in AOF only when doing concurrent cmd handling (which we are not)
 		s.Set(cmd.Key, cmd.Val)
 		cs.writeCh <- cmd.Key
 	case "VIEW":
@@ -282,16 +289,25 @@ func ExecuteCommand(s Storage, cs *ConnState, dbServer *DbServer, cmd Command) {
 	}
 }
 
+func (db *DbServer) FsyncLoop() {
+	ticker := time.NewTicker(time.Second * 2)
+
+	for range ticker.C {
+		db.aofFile.fileMu.Lock()
+		db.aofFile.file.Sync()
+		db.aofFile.fileMu.Unlock()
+	}
+}
+
 func main() {
 	vapourDB := CreateDb()
 	dbServer := NewServer(":8080")
-	(dbServer.LoadAOF(vapourDB))
-	for i := 0; i < MAX_GOROUTINES; i++ {
-		go func() {
-			dbServer.HandleCommand(vapourDB)
-		}()
+	go dbServer.AOFWriter()
+	go dbServer.FsyncLoop()
+	if err := dbServer.LoadAOF(vapourDB); err != nil {
+		log.Fatal("failed to load AOF:", err)
 	}
-
+	go dbServer.HandleCommand(vapourDB)
 	signalCh := make(chan os.Signal, 1)
 	signal.Notify(signalCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
