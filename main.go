@@ -71,8 +71,6 @@ func (db *DbServer) Start() error {
 	go db.AcceptLoop()
 	<-db.quitCh
 	ln.Close()
-	close(db.aofCh)
-	close(db.msgCh)
 	db.aofFile.fileMu.Lock()
 	db.aofFile.file.Close()
 	db.aofFile.fileMu.Unlock()
