@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/wajeshubham/vapourdb/protocol"
 	"github.com/wajeshubham/vapourdb/storage"
@@ -42,4 +43,20 @@ func (db *DbServer) LoadAOF(s storage.Storage) error {
 	}
 	fmt.Println("Loaded AOF")
 	return scanner.Err()
+}
+
+func (db *DbServer) AOFWriter() {
+	for cmd := range db.AofCh {
+		db.WriteAOF(cmd)
+	}
+}
+
+func (db *DbServer) FsyncLoop() {
+	ticker := time.NewTicker(time.Second * 2)
+
+	for range ticker.C {
+		db.AofFile.FileMu.Lock()
+		db.AofFile.File.Sync()
+		db.AofFile.FileMu.Unlock()
+	}
 }

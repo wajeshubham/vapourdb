@@ -8,7 +8,6 @@ import (
 	"net"
 	"os"
 	"sync"
-	"time"
 
 	"github.com/wajeshubham/vapourdb/protocol"
 	"github.com/wajeshubham/vapourdb/storage"
@@ -103,12 +102,6 @@ func (db *DbServer) WriteToConn(cs *ConnState) {
 	}
 }
 
-func (db *DbServer) AOFWriter() {
-	for cmd := range db.AofCh {
-		db.WriteAOF(cmd)
-	}
-}
-
 func (db *DbServer) ApplyCommand(s storage.Storage, cmd protocol.Command) {
 	switch cmd.Root {
 	case "SET":
@@ -136,16 +129,6 @@ func (db *DbServer) ExecuteCommand(s storage.Storage, cs *ConnState, cmd protoco
 		cs.WriteCh <- op
 	default:
 		cs.WriteCh <- "UNKNOWN COMMAND"
-	}
-}
-
-func (db *DbServer) FsyncLoop() {
-	ticker := time.NewTicker(time.Second * 2)
-
-	for range ticker.C {
-		db.AofFile.FileMu.Lock()
-		db.AofFile.File.Sync()
-		db.AofFile.FileMu.Unlock()
 	}
 }
 
