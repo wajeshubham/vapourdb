@@ -90,7 +90,7 @@ func (db *DbServer) AcceptLoop() {
 			conn:    conn,
 			writeCh: make(chan string, 32),
 		}
-		go WriteToConn(cs)
+		go db.WriteToConn(cs)
 		go db.ReadConnection(cs)
 	}
 }
@@ -244,7 +244,7 @@ func ParseCommand(cmd string) (Command, error) {
 	}, err
 }
 
-func WriteToConn(cs *ConnState) {
+func (db *DbServer) WriteToConn(cs *ConnState) {
 	for msg := range cs.writeCh {
 		fmt.Fprintf(cs.conn, "%v\n", msg)
 	}
