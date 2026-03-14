@@ -15,6 +15,7 @@ type Command struct {
 	RawVal string
 }
 
+// Basic command parser
 func ParseCommand(cmd string) (Command, error) {
 	cmd = strings.TrimSpace(cmd)
 	command := strings.Fields(cmd)
@@ -52,13 +53,13 @@ func ParseCommand(cmd string) (Command, error) {
 			fmt.Println("Parsing ERROR: ", err)
 			fmt.Println("Fallback to string type to handle error silently")
 			err = nil
-			val = _val
+			val = _val // fallback to str
 		}
 	}
 	return Command{
 		Root:   rootCommand,
 		Key:    key,
 		Val:    val,
-		RawVal: _val,
+		RawVal: _val, // Val for AOF
 	}, err
 }

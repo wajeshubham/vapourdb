@@ -61,6 +61,7 @@ func (db *DbServer) AcceptLoop() {
 			Conn:    conn,
 			WriteCh: make(chan string, 32),
 		}
+		// Isolate the connection in writer and reader to avoid conflicts
 		go db.WriteToConn(cs)
 		go db.ReadConnection(cs)
 	}
@@ -102,7 +103,9 @@ func (db *DbServer) WriteToConn(cs *ConnState) {
 	}
 }
 
+// Different command handler for AOF file
 func (db *DbServer) ApplyCommand(s storage.Storage, cmd protocol.Command) {
+	// Need extra validation for AOF is better, for now its fine
 	switch cmd.Root {
 	case "SET":
 		s.Set(cmd.Key, cmd.Val)
@@ -117,7 +120,7 @@ func (db *DbServer) ExecuteCommand(s storage.Storage, cs *ConnState, cmd protoco
 		val := s.Get(cmd.Key)
 		cs.WriteCh <- fmt.Sprint(val)
 	case "DELETE":
-		db.AofCh <- cmd
+		db.AofCh <- cmd // using single goroutine to process commands will avoid race between multiple coroutine and guarantees order
 		s.Delete(cmd.Key)
 		cs.WriteCh <- cmd.Key
 	case "SET":
