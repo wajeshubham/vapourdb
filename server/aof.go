@@ -51,6 +51,10 @@ func (db *DbServer) AOFWriter() {
 	}
 }
 
+// Scheduled fsync for the AOF file so data actually reaches disk
+// the writes normally go to the OS page cache first, so without this
+// a crash could lose recent commands. This loop flushes the data
+// every few seconds. This is a simplified durability model though, prod systems like redis have some safeguards to improve it
 func (db *DbServer) FsyncLoop() {
 	ticker := time.NewTicker(time.Second * 2)
 
